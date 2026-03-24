@@ -101,8 +101,12 @@ if __name__ == '__main__':
     print(f"  T2: {len(t2g)} plays | {t2w}W {len(t2g)-t2w}L")
 
     print("\n[3/3] Saving and pushing...")
+    def _safe(obj):
+        if isinstance(obj, float) and (obj != obj or obj == float('inf') or obj == float('-inf')):
+            return None
+        return str(obj)
     with open(TODAY_JSON,'w') as f:
-        json.dump(plays, f, separators=(',',':'), default=str)
+        json.dump(plays, f, separators=(',',':'), default=_safe)
     print(f"  Saved today.json")
 
     try:

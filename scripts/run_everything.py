@@ -214,8 +214,13 @@ if __name__ == '__main__':
     all_plays = score_all(props, lkp, existing)
 
     print("\n[5/5] Saving and pushing...")
+    # NaN-safe serialiser: converts NaN/Inf → None (JSON null)
+    def _safe(obj):
+        if isinstance(obj, float) and (obj != obj or obj == float('inf') or obj == float('-inf')):
+            return None
+        return str(obj)
     with open(TODAY_JSON,'w') as f:
-        json.dump(all_plays, f, separators=(',',':'), default=str)
+        json.dump(all_plays, f, separators=(',',':'), default=_safe)
     print(f"  Saved today.json ({len(all_plays)} plays)")
 
     stats = season_stats(all_plays)

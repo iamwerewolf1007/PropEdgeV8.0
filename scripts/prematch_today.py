@@ -280,8 +280,12 @@ if __name__ == '__main__':
     t3 = [p for p in todays if p['tier'] == 'T3']
     print(f"\n  {target_date}: {len(todays)} plays | T1:{len(t1)} T2:{len(t2)} T3:{len(t3)}")
 
+    def _safe(obj):
+        if isinstance(obj, float) and (obj != obj or obj == float('inf') or obj == float('-inf')):
+            return None
+        return str(obj)
     with open(TODAY_JSON, 'w') as f:
-        json.dump(merged, f, separators=(',', ':'), default=str)
+        json.dump(merged, f, separators=(',', ':'), default=_safe)
     print(f"  Saved today.json ({len(merged)} total plays)")
 
     try:
