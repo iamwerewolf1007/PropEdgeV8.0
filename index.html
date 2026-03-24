@@ -327,13 +327,23 @@ function parseET(gt) {
 
 // ── DATA LOAD ─────────────────────────────────────────────────────────────────
 async function loadData() {
+  console.log('PropEdge V8: loadData() started');
   try {
+    console.log('Fetching today.json...');
     const r = await fetch('today.json?v='+Date.now());
     ALL_PLAYS = await r.json();
+    console.log('PropEdge V8: loaded', ALL_PLAYS.length, 'plays');
     init();
   } catch(e) {
+    console.error('PropEdge load error:', e);
+    const msg = e && e.message ? e.message : String(e);
     document.getElementById('cardsContainer').innerHTML =
-      '<div class="empty"><div class="empty-icon">⚠️</div><p>Could not load today.json</p></div>';
+      `<div class="empty"><div class="empty-icon">⚠️</div>
+       <p style="color:#ff6b6b;font-weight:700">Could not load today.json</p>
+       <p style="font-size:11px;margin-top:8px;color:#888">${msg}</p>
+       <p style="font-size:10px;margin-top:4px;color:#666">
+         Check: github.com/iamwerewolf1007/PropEdgeV8.0/blob/main/today.json
+       </p></div>`;
   }
 }
 
