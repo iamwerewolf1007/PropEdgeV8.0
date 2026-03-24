@@ -3,9 +3,15 @@ PropEdge V8 — prematch_today.py
 Fetches today's NBA player props from The Odds API, scores them, merges into today.json.
 
 Usage: python3 scripts/prematch_today.py [YYYY-MM-DD]
+       (defaults to today's ET date if no argument given)
+
+TIMEZONE NOTE:
+  All event filtering uses ET date (not UTC) because NBA games starting after
+  8 PM ET roll over to the next UTC date (e.g. 9 PM EDT = 01:00 UTC next day).
+  DST 2026: EDT (UTC-4) active Mar 8 → Nov 1.
 """
-import os, sys, json, time, requests
-from datetime import datetime, date
+import os, sys, json, time, requests, subprocess
+from datetime import datetime, date, timedelta, timezone
 import pandas as pd
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -17,9 +23,9 @@ from xlsx_engine import load_all_sheets
 from model import score_prop
 from run_everything import _build_lookups
 
-ODDS_KEY  = 'c0bab20a574208a41a6e0d930cdaf313'
-BASE_URL  = 'https://api.the-odds-api.com/v4'
-SPORT     = 'basketball_nba'
+ODDS_KEY     = 'c0bab20a574208a41a6e0d930cdaf313'
+BASE_URL     = 'https://api.the-odds-api.com/v4'
+SPORT        = 'basketball_nba'
 CREDIT_ALERT = 170
 
 NAME_TO_ABBR = {
@@ -37,123 +43,176 @@ NAME_TO_ABBR = {
 }
 
 
-def _alert_low_credits(headers):
+def _utc_to_et_date(utc_iso: str) -> str:
+    """
+    Convert a UTC ISO timestamp to ET date string (YYYY-MM-DD).
+    US DST 2026: EDT (UTC-4) Mar 8 → Nov 1; EST (UTC-5) otherwise.
+    Prevents late NBA games (>8 PM ET) rolling over to the next UTC date.
+    e.g. 9 PM EDT Mar 23 = 01:00 UTC Mar 24 → correctly returns '2026-03-23'.
+    """
+    s  = utc_iso.replace('Z', '+00:00')
+    dt = datetime.fromisoformat(s).astimezone(timezone.utc)
+    et_offset = timedelta(hours=-4) if 3 <= dt.month <= 10 else timedelta(hours=-5)
+    return (dt + et_offset).strftime('%Y-%m-%d')
+
+
+def _et_today() -> str:
+    """Return today's date in ET (handles UTC midnight rollover)."""
+    utc_now = datetime.now(timezone.utc)
+    et_offset = timedelta(hours=-4) if 3 <= utc_now.month <= 10 else timedelta(hours=-5)
+    return (utc_now + et_offset).strftime('%Y-%m-%d')
+
+
+def _alert_credits(headers: dict):
     rem = headers.get('x-requests-remaining')
+    used = headers.get('x-requests-used')
+    print(f"  Credits — used:{used}  remaining:{rem}")
     if rem and int(rem) <= CREDIT_ALERT:
         msg = f"Odds API credits LOW: {rem} remaining"
         print(f"⚠️  {msg}")
         try:
-            import subprocess
-            subprocess.run(['osascript','-e',
+            subprocess.run(['osascript', '-e',
                 f'display notification "{msg}" with title "PropEdge V8"'],
                 capture_output=True)
-        except Exception: pass
+        except Exception:
+            pass
 
 
-def fetch_events(target_date):
+def fetch_events(target_date: str) -> list:
+    """
+    Fetch all NBA events for target_date (in ET).
+    Filters by ET date — not UTC — so late games are not missed.
+    """
     r = requests.get(f"{BASE_URL}/sports/{SPORT}/events",
-                     params={'apiKey':ODDS_KEY,'dateFormat':'iso'}, timeout=15)
-    _alert_low_credits(r.headers)
+                     params={'apiKey': ODDS_KEY, 'dateFormat': 'iso'},
+                     timeout=15)
+    _alert_credits(r.headers)
     r.raise_for_status()
-    return [e for e in r.json() if e.get('commence_time','')[:10] == target_date]
+    # Filter: compare ET date of commence_time to target_date
+    events = [
+        e for e in r.json()
+        if _utc_to_et_date(e.get('commence_time', '1970-01-01T00:00:00Z')) == target_date
+    ]
+    print(f"  Found {len(events)} games on {target_date} (ET)")
+    return events
 
 
-def fetch_props(event, target_date):
+def fetch_props(event: dict, target_date: str) -> list:
+    """Fetch player points props for one event."""
     eid  = event['id']
-    home = NAME_TO_ABBR.get(event.get('home_team',''), event.get('home_team',''))
-    away = NAME_TO_ABBR.get(event.get('away_team',''), event.get('away_team',''))
-    r = requests.get(f"{BASE_URL}/sports/{SPORT}/events/{eid}/odds",
-                     params={'apiKey':ODDS_KEY,'regions':'us','markets':'player_points',
-                             'oddsFormat':'american','dateFormat':'iso'}, timeout=15)
-    _alert_low_credits(r.headers)
-    if r.status_code != 200: return []
+    home = NAME_TO_ABBR.get(event.get('home_team', ''), event.get('home_team', ''))
+    away = NAME_TO_ABBR.get(event.get('away_team', ''), event.get('away_team', ''))
 
-    player_data = {}
-    for book in r.json().get('bookmakers',[]):
-        for mkt in book.get('markets',[]):
-            if mkt.get('key') != 'player_points': continue
-            for o in mkt.get('outcomes',[]):
-                p     = o.get('description', o.get('name',''))
-                line  = float(o.get('point', 0))
-                odds  = int(o.get('price',-110))
-                otype = o.get('name','')
-                if p not in player_data: player_data[p] = {}
-                if line not in player_data[p]:
-                    player_data[p][line] = {'over':[],'under':[],'books':set()}
-                player_data[p][line]['books'].add(book.get('title',''))
-                if 'Over' in otype: player_data[p][line]['over'].append(odds)
-                else:               player_data[p][line]['under'].append(odds)
+    r = requests.get(
+        f"{BASE_URL}/sports/{SPORT}/events/{eid}/odds",
+        params={'apiKey': ODDS_KEY, 'regions': 'us', 'markets': 'player_points',
+                'oddsFormat': 'american', 'dateFormat': 'iso'},
+        timeout=15
+    )
+    _alert_credits(r.headers)
+    if r.status_code != 200:
+        print(f"    WARN {eid}: HTTP {r.status_code}")
+        return []
 
+    player_data: dict = {}
+    for book in r.json().get('bookmakers', []):
+        for mkt in book.get('markets', []):
+            if mkt.get('key') != 'player_points':
+                continue
+            for o in mkt.get('outcomes', []):
+                player = o.get('description', o.get('name', ''))
+                line   = float(o.get('point', 0))
+                odds   = int(o.get('price', -110))
+                otype  = o.get('name', '')
+                if player not in player_data:
+                    player_data[player] = {}
+                if line not in player_data[player]:
+                    player_data[player][line] = {'over': [], 'under': [], 'books': set()}
+                player_data[player][line]['books'].add(book.get('title', ''))
+                if 'Over' in otype:
+                    player_data[player][line]['over'].append(odds)
+                else:
+                    player_data[player][line]['under'].append(odds)
+
+    # Consensus line: most bookmakers agreeing
+    gt = event.get('commence_time', '')[:16].replace('T', ' ') + ' UTC'
     results = []
-    gt = event.get('commence_time','')[:16].replace('T',' ')
     for player, lines in player_data.items():
         best = max(lines, key=lambda l: len(lines[l]['books']))
-        d = lines[best]
-        n = len(d['books'])
-        if n == 0: continue
+        d    = lines[best]
+        n    = len(d['books'])
+        if n == 0:
+            continue
         results.append(dict(
             player=player, home=home, away=away,
-            game=f"{event.get('away_team',away)} @ {event.get('home_team',home)}",
-            game_time=gt, event_id=eid,
-            line=best,
+            game=f"{event.get('away_team', away)} @ {event.get('home_team', home)}",
+            game_time=gt, event_id=eid, line=best,
             min_line=min(lines.keys()), max_line=max(lines.keys()),
-            over_odds =int(sum(d['over'])/len(d['over']))   if d['over']  else -110,
-            under_odds=int(sum(d['under'])/len(d['under'])) if d['under'] else -110,
+            over_odds =int(sum(d['over'])  / len(d['over']))  if d['over']  else -110,
+            under_odds=int(sum(d['under']) / len(d['under'])) if d['under'] else -110,
             books=n,
         ))
     return results
 
 
-def score_and_merge(raw_props, target_date, lkp, existing_plays):
+def score_and_merge(raw_props: list, target_date: str, lkp: dict,
+                    existing_plays: list) -> list:
+    """Score fetched props and merge into existing_plays — dedup by player+date+line."""
+    # Index existing ungraded plays
     idx_map = {}
     for i, p in enumerate(existing_plays):
-        if p.get('result') not in ('WIN','LOSS','DNP','PUSH','NO_PLAY'):
-            idx_map[(p['player'], p.get('date',''), float(p.get('line',0)))] = i
+        if p.get('result') not in ('WIN', 'LOSS', 'DNP', 'PUSH', 'NO_PLAY'):
+            idx_map[(p['player'], p.get('date', ''), float(p.get('line', 0)))] = i
 
     new_plays = []
+    scored = updated = skipped = 0
+
     for raw in raw_props:
         player = raw['player']
         line   = raw['line']
         home, away = raw['home'], raw['away']
 
-        pt = lkp['team'].get(player,'')
-        if not pt: continue
+        pt = lkp['team'].get(player, '')
+        if not pt:
+            skipped += 1
+            continue
 
         is_home = pt.upper() == home.upper()
         opp     = away if is_home else home
         is_b2b  = lkp['b2b_flag'].get((player, target_date), False)
         avg_r   = lkp['avg'].get(player, {})
-        if not avg_r: continue
+        if not avg_r:
+            skipped += 1
+            continue
 
         result = score_prop(
             line=line, player_name=player, opponent=opp,
             is_home=is_home, is_b2b=is_b2b,
             avg_row=avg_r,
-            ha_row=lkp['ha'].get(player,{}),
-            b2b_row=lkp['b2b'].get(player,{}),
-            oq_row=lkp['oq'].get(player,{}),
-            h2h_row=lkp['h2h'].get((player,opp),{}),
-            shoot_row=lkp['sh'].get(player,{}),
-            mins_row=lkp['mn'].get(player,{}),
+            ha_row=lkp['ha'].get(player, {}),
+            b2b_row=lkp['b2b'].get(player, {}),
+            oq_row=lkp['oq'].get(player, {}),
+            h2h_row=lkp['h2h'].get((player, opp), {}),
+            shoot_row=lkp['sh'].get(player, {}),
+            mins_row=lkp['mn'].get(player, {}),
         )
 
-        avg_r2 = lkp['avg'].get(player, {})
-        r20    = lkp['recent20'].get(player, {})
+        r20  = lkp['recent20'].get(player, {})
         play = dict(
             player=player, team=pt, position='',
-            date=target_date, game_time=raw['game_time'], game=raw['game'],
-            home=home, away=away, opponent=opp,
+            date=target_date, game_time=raw['game_time'],
+            game=raw['game'], home=home, away=away, opponent=opp,
             is_home=is_home, is_b2b=is_b2b,
             line=line, min_line=raw['min_line'], max_line=raw['max_line'],
             over_odds=raw['over_odds'], under_odds=raw['under_odds'],
             books=raw['books'], event_id=raw['event_id'],
             direction=result['direction'], confidence=result['confidence'],
             tier=result['tier'], prob_over=result['prob_over'],
-            signals={str(k):v for k,v in result['signals'].items()},
+            signals={str(k): v for k, v in result['signals'].items()},
             result=None, actual_pts=None,
-            l10=avg_r2.get('L10 Avg PTS'),
-            l20=avg_r2.get('L20 Avg PTS'),
-            l30=avg_r2.get('L30 Avg PTS'),
+            l10=avg_r.get('L10 Avg PTS'),
+            l20=avg_r.get('L20 Avg PTS'),
+            l30=avg_r.get('L30 Avg PTS'),
             recent20=r20.get('scores', []),
             recent20_homes=r20.get('homes', []),
             line_history=[line],
@@ -161,25 +220,27 @@ def score_and_merge(raw_props, target_date, lkp, existing_plays):
 
         k = (player, target_date, float(line))
         if k in idx_map:
-            # Preserve line_history — append new line if it changed
             prev = existing_plays[idx_map[k]]
             hist = prev.get('line_history', [prev.get('line', line)])
             if line not in hist:
                 hist = hist + [line]
             play['line_history'] = hist
             existing_plays[idx_map[k]] = play
+            updated += 1
         else:
             new_plays.append(play)
+            scored += 1
 
+    print(f"  Scored:{scored}  Updated:{updated}  Skipped:{skipped}")
     return existing_plays + new_plays
 
 
 if __name__ == '__main__':
-    import subprocess
-    target_date = sys.argv[1] if len(sys.argv) > 1 else str(date.today())
-    print("="*60)
+    target_date = sys.argv[1] if len(sys.argv) > 1 else _et_today()
+
+    print("=" * 60)
     print(f"PropEdge V8 — prematch_today.py  [{target_date}]")
-    print("="*60)
+    print("=" * 60)
 
     print("\n[1/4] Loading database...")
     sheets = load_all_sheets()
@@ -187,41 +248,50 @@ if __name__ == '__main__':
     gl['Date'] = pd.to_datetime(gl['Date'])
     lkp = _build_lookups(sheets, gl)
 
-    print("\n[2/4] Fetching events...")
+    print("\n[2/4] Fetching events from Odds API...")
     events = fetch_events(target_date)
-    print(f"  {len(events)} games on {target_date}")
-    if not events: sys.exit(0)
+    if not events:
+        print("  No games found for this date.")
+        sys.exit(0)
 
-    print("\n[3/4] Fetching player props...")
+    print("\n[3/4] Fetching player props per game...")
     all_raw = []
     for ev in events:
-        home = NAME_TO_ABBR.get(ev.get('home_team',''), ev.get('home_team',''))
-        away = NAME_TO_ABBR.get(ev.get('away_team',''), ev.get('away_team',''))
+        home = NAME_TO_ABBR.get(ev.get('home_team', ''), ev.get('home_team', ''))
+        away = NAME_TO_ABBR.get(ev.get('away_team', ''), ev.get('away_team', ''))
         print(f"  {away} @ {home}")
-        all_raw.extend(fetch_props(ev, target_date))
+        props = fetch_props(ev, target_date)
+        print(f"    → {len(props)} player props")
+        all_raw.extend(props)
         time.sleep(0.5)
-    print(f"  Total raw props: {len(all_raw)}")
 
+    print(f"\n  Total raw props: {len(all_raw)}")
+    if not all_raw:
+        print("  No props retrieved.")
+        sys.exit(0)
+
+    print("\n[4/4] Scoring, merging, saving...")
     existing = json.load(open(TODAY_JSON)) if os.path.exists(TODAY_JSON) else []
-    print("\n[4/4] Scoring and saving...")
-    merged = score_and_merge(all_raw, target_date, lkp, existing)
-    todays = [p for p in merged if p['date']==target_date]
-    t1=[p for p in todays if p['tier']=='T1']
-    t2=[p for p in todays if p['tier']=='T2']
-    t3=[p for p in todays if p['tier']=='T3']
+    merged   = score_and_merge(all_raw, target_date, lkp, existing)
+
+    todays = [p for p in merged if p['date'] == target_date]
+    t1 = [p for p in todays if p['tier'] == 'T1']
+    t2 = [p for p in todays if p['tier'] == 'T2']
+    t3 = [p for p in todays if p['tier'] == 'T3']
     print(f"\n  {target_date}: {len(todays)} plays | T1:{len(t1)} T2:{len(t2)} T3:{len(t3)}")
 
-    with open(TODAY_JSON,'w') as f:
-        json.dump(merged, f, separators=(',',':'), default=str)
-    print(f"  Saved today.json ({len(merged)} total)")
+    with open(TODAY_JSON, 'w') as f:
+        json.dump(merged, f, separators=(',', ':'), default=str)
+    print(f"  Saved today.json ({len(merged)} total plays)")
 
     try:
         cwd = os.path.abspath(REPO_ROOT)
         msg = f"Prematch {target_date} | T1:{len(t1)} T2:{len(t2)} T3:{len(t3)}"
-        subprocess.run(['git','add','-A'],         cwd=cwd, check=True, capture_output=True)
-        subprocess.run(['git','commit','-m',msg],  cwd=cwd, check=True, capture_output=True)
-        subprocess.run(['git','push'],             cwd=cwd, check=True, capture_output=True)
-        print(f"  Git push OK")
+        subprocess.run(['git', 'add', '-A'],         cwd=cwd, check=True, capture_output=True)
+        subprocess.run(['git', 'commit', '-m', msg], cwd=cwd, check=True, capture_output=True)
+        subprocess.run(['git', 'push'],              cwd=cwd, check=True, capture_output=True)
+        print(f"  Git push OK: {msg}")
     except Exception as e:
         print(f"  Git push failed: {e}")
+
     print("\nDone.")

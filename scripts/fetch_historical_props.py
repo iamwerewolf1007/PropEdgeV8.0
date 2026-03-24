@@ -54,13 +54,30 @@ def _alert(headers):
         except Exception: pass
 
 
+def _utc_to_et_date(utc_iso: str) -> str:
+    """
+    Convert a UTC ISO timestamp to ET date string (YYYY-MM-DD).
+    US DST 2026: EDT (UTC-4) from Mar 8 → Nov 1; EST (UTC-5) otherwise.
+    NBA schedule always uses ET — this prevents late games (>8 PM ET)
+    from rolling over to the next UTC date and being filtered out.
+    """
+    from datetime import datetime, timedelta, timezone
+    s = utc_iso.replace('Z', '+00:00')
+    dt = datetime.fromisoformat(s).astimezone(timezone.utc)
+    # EDT window: second Sunday of March → first Sunday of November
+    # 2026: Mar 8 → Nov 1
+    month = dt.month
+    et_offset = timedelta(hours=-4) if 3 <= month <= 10 else timedelta(hours=-5)
+    return (dt + et_offset).strftime('%Y-%m-%d')
+
+
 def fetch_historical_events(target_date: str) -> list:
     """
     Get all NBA events for target_date using historical endpoint.
     Uses a snapshot at noon ET (17:00 UTC) — pre-game lines.
     """
     # Snapshot time: noon ET on the game day = 17:00 UTC
-    snapshot = f"{target_date}T17:00:00Z"
+    snapshot = f"{target_date}T12:00:00Z"  # 8 AM EDT — before any game starts
     url = f"{BASE}/historical/sports/{SPORT}/events"
     params = {
         'apiKey':   ODDS_KEY,
@@ -74,7 +91,7 @@ def fetch_historical_events(target_date: str) -> list:
     data = resp.json()
     events = data.get('data', data) if isinstance(data, dict) else data
     # Filter to just this date
-    day_events = [e for e in events if e.get('commence_time','')[:10] == target_date]
+    day_events = [e for e in events if _utc_to_et_date(e.get('commence_time','1970-01-01T00:00:00Z')) == target_date]
     print(f"  Found {len(day_events)} events on {target_date}")
     return day_events, snapshot
 
